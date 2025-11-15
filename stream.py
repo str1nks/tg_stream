@@ -19,7 +19,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # --- Video paths ---
-VIDEO_DIR = "./videos"
+VIDEO_DIR = "/videos"
 DEFAULT_VIDEO = "video.mp4"
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
