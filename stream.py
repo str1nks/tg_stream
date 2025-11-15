@@ -6,6 +6,9 @@ from aiogram.enums import ContentType
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 
+def log(*args):
+    print("[LOG]", *args)
+
 # --- Telegram bot setup ---
 session = AiohttpSession(timeout=120)  # увеличить таймаут скачивания
 bot = Bot(
@@ -27,22 +30,21 @@ current_video = None    # текущее воспроизводимое виде
 pending_upload_name = {}  # user_id -> filename
 
 
-# --- Safely stop FFmpeg ---
 async def stop_ffmpeg():
     global ffmpeg_process
 
     if ffmpeg_process:
+        log("Останавливаю текущий FFmpeg процесс…")
         try:
-            # процесс жив?
             if ffmpeg_process.returncode is None:
                 ffmpeg_process.kill()
                 await ffmpeg_process.wait()
-        except ProcessLookupError:
-            pass
-        except Exception:
-            pass
+                log("FFmpeg остановлен.")
+        except Exception as e:
+            log("Ошибка при остановке FFmpeg:", e)
 
     ffmpeg_process = None
+
 
 
 # --- Play video via FFmpeg ---
@@ -50,6 +52,8 @@ async def play_video(video_path, loop=False):
     global ffmpeg_process, current_video
 
     await stop_ffmpeg()
+
+    log(f"Запускаю FFmpeg: {video_path} {'(loop)' if loop else ''}")
 
     cmd = [
         "ffmpeg",
@@ -68,7 +72,6 @@ async def play_video(video_path, loop=False):
         cmd.insert(1, "-stream_loop")
         cmd.insert(2, "-1")
 
-    # Запускаем FFmpeg
     try:
         ffmpeg_process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -76,29 +79,33 @@ async def play_video(video_path, loop=False):
             stderr=asyncio.subprocess.PIPE
         )
         current_video = video_path
-        print(f"[FFmpeg] Playing {video_path} {'(loop)' if loop else ''}")
+        log("FFmpeg ЗАПУЩЕН. PID:", ffmpeg_process.pid)
 
     except Exception as e:
-        print("[FFmpeg ERROR]", e)
+        log("FFmpeg НЕ ЗАПУСТИЛСЯ:", e)
         ffmpeg_process = None
         return
 
-    # Проверяем на битые файлы (moov atom etc)
     async def watch_errors():
         if ffmpeg_process:
             stderr = await ffmpeg_process.stderr.read()
             text = stderr.decode(errors="ignore")
 
             if "moov atom not found" in text or "Invalid data" in text:
-                print("[FFmpeg] Битый mp4 файл!")
+                log("FFmpeg ERROR: битый mp4 файл!")
                 await stop_ffmpeg()
+
+            # общий фулл-лог
+            log("FFmpeg stderr:\n", text)
 
     asyncio.create_task(watch_errors())
 
 
 # --- Autostart default video ---
 async def start_default_video():
+    log("Автостарт основного видео…")
     await play_video(os.path.join(VIDEO_DIR, DEFAULT_VIDEO), loop=True)
+
 
 # --- /list ---
 @dp.message(F.text == "/list")
