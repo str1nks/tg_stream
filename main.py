@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-# main.py
 import asyncio
 import os
 import signal
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 from yt_dlp import YoutubeDL
-
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -21,48 +18,28 @@ RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
 STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
 COOKIES_FILE = "cookies.txt"
-
-PLACEHOLDER_URL = "https://www.youtube.com/watch?v=G-kF940PFE4"
-YTDLP_CMD = "yt-dlp"
 FFMPEG_CMD = "ffmpeg"
 # ==========================================
 
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher()
 
-
 @dataclass
 class VideoItem:
     url: str
-    title: Optional[str] = None
     added_by: Optional[int] = None
-
 
 @dataclass
 class StreamState:
     process: Optional[subprocess.Popen] = None
-    current: Optional[VideoItem] = None
     queue: List[VideoItem] = field(default_factory=list)
     playing_queue: bool = False
-    is_paused: bool = False
-    placeholder_pos: float = 0.0
-    placeholder_last_start: Optional[float] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
 
 state = StreamState()
 
-
-# --------------- utils ----------------
-async def owner_only(msg: Message) -> bool:
-    return msg.from_user and msg.from_user.id == OWNER_ID
-
-
+# ---------------- utils -------------------
 def get_video_stream_url(youtube_url: str) -> str:
-    """
-    Получаем прямой потоковый URL (HLS/DASH) для ffmpeg.
-    yt-dlp НЕ скачивает видео на диск, только возвращает ссылку.
-    """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -70,26 +47,17 @@ def get_video_stream_url(youtube_url: str) -> str:
         "noplaylist": True,
         "cookiefile": COOKIES_FILE,
     }
-
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
-
     if "url" in info:
         return info["url"]
-
     if "formats" in info:
-        # Ищем поток с HLS/DASH
         for f in info["formats"]:
-            if f.get("protocol") in ("m3u8_native", "https") and f.get("url"):
+            if f.get("url"):
                 return f["url"]
-
     raise RuntimeError("Не удалось получить прямой потоковый URL")
 
-
-def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
-    """
-    Запускаем ffmpeg, читаем из input_url и пушим в FULL_RTMP.
-    """
+def spawn_ffmpeg(input_url: str) -> subprocess.Popen:
     args = [
         FFMPEG_CMD,
         "-i", input_url,
@@ -105,12 +73,7 @@ def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subp
         "-f", "flv",
         FULL_RTMP
     ]
-    if extra_args:
-        args = args[:-1] + extra_args + [args[-1]]
-
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
-    return proc
-
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
 
 async def stop_process(proc: subprocess.Popen):
     if proc and proc.poll() is None:
@@ -126,107 +89,39 @@ async def stop_process(proc: subprocess.Popen):
             except Exception:
                 proc.kill()
 
-
-def pause_process_posix(proc: subprocess.Popen):
-    if proc and proc.poll() is None:
-        os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
-
-
-def resume_process_posix(proc: subprocess.Popen):
-    if proc and proc.poll() is None:
-        os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
-
-
-# --------------- core streaming ----------------
+# ---------------- core --------------------
 async def play_item(item: VideoItem):
     async with state.lock:
-        state.current = item
-        state.is_paused = False
-
+        state.process = None
     try:
         direct = get_video_stream_url(item.url)
     except Exception as e:
-        await bot.send_message(OWNER_ID, f"Ошибка получения потока для {item.url}: {e}")
+        await bot.send_message(OWNER_ID, f"Ошибка получения потока: {e}")
         return
-
-    extra_ff_args = None
-    if item.url == PLACEHOLDER_URL:
-        ss = int(state.placeholder_pos)
-        if ss > 0:
-            extra_ff_args = ["-ss", str(ss)]
-
-    proc = spawn_ffmpeg(direct, extra_args=extra_ff_args)
+    proc = spawn_ffmpeg(direct)
     async with state.lock:
         state.process = proc
-        if item.url == PLACEHOLDER_URL:
-            state.placeholder_last_start = time.time()
-
-    try:
-        await asyncio.to_thread(proc.wait)
-    finally:
-        async with state.lock:
-            if item.url == PLACEHOLDER_URL and state.placeholder_last_start:
-                played = time.time() - state.placeholder_last_start
-                state.placeholder_pos += played
-                state.placeholder_last_start = None
-            state.process = None
-            state.current = None
-
+    await asyncio.to_thread(proc.wait)
     async with state.lock:
-        if state.playing_queue and state.queue:
-            return
-        if state.playing_queue and not state.queue:
-            await start_placeholder()
-
-
-async def start_placeholder():
-    async with state.lock:
-        if state.current and state.current.url == PLACEHOLDER_URL:
-            return
-        proc = state.process
-    if proc:
-        await stop_process(proc)
-    placeholder_item = VideoItem(url=PLACEHOLDER_URL, title="placeholder")
-    asyncio.create_task(play_item(placeholder_item))
-
+        state.process = None
 
 async def start_queue_runner():
     async with state.lock:
         if state.playing_queue:
             return
         state.playing_queue = True
-
     while True:
         async with state.lock:
-            if not state.playing_queue:
-                break
             if not state.queue:
                 state.playing_queue = False
                 break
             item = state.queue.pop(0)
-        async with state.lock:
             proc = state.process
         if proc:
             await stop_process(proc)
         await play_item(item)
 
-    await start_placeholder()
-
-
-# --------------- bot commands ----------------
-@dp.message(Command("start"))
-async def cmd_start_queue(msg: Message):
-    if msg.from_user.id != OWNER_ID:
-        return
-    await msg.reply("Запуск очереди...")
-    async with state.lock:
-        if not state.queue:
-            await msg.reply("Очередь пуста.")
-            return
-    asyncio.create_task(start_queue_runner())
-    await msg.reply("Очередь запущена.")
-
-
+# ---------------- bot commands ----------------
 @dp.message(Command("play"))
 async def cmd_play(msg: Message):
     if msg.from_user.id != OWNER_ID:
@@ -236,19 +131,12 @@ async def cmd_play(msg: Message):
         await msg.reply("Использование: /play <youtube_url>")
         return
     url = args[1].strip()
-    await msg.reply(f"Запускаю: {url}")
     async with state.lock:
         proc = state.process
-        was_placeholder = state.current and state.current.url == PLACEHOLDER_URL
     if proc:
-        if was_placeholder and state.placeholder_last_start:
-            played = time.time() - state.placeholder_last_start
-            state.placeholder_pos += played
-            state.placeholder_last_start = None
         await stop_process(proc)
-    state.playing_queue = False
     asyncio.create_task(play_item(VideoItem(url=url, added_by=msg.from_user.id)))
-
+    await msg.reply(f"Воспроизвожу: {url}")
 
 @dp.message(Command("add"))
 async def cmd_add(msg: Message):
@@ -262,8 +150,7 @@ async def cmd_add(msg: Message):
     async with state.lock:
         state.queue.append(VideoItem(url=url, added_by=msg.from_user.id))
         qlen = len(state.queue)
-    await msg.reply(f"Добавлено. Позиция в очереди: {qlen}")
-
+    await msg.reply(f"Добавлено в очередь. Позиция: {qlen}")
 
 @dp.message(Command("list"))
 async def cmd_list(msg: Message):
@@ -271,16 +158,22 @@ async def cmd_list(msg: Message):
         return
     async with state.lock:
         text = []
-        if state.current:
-            text.append(f"Сейчас: {state.current.url}")
+        if state.process:
+            text.append("Сейчас играет видео")
         if state.queue:
             text.append("Очередь:")
             for i, it in enumerate(state.queue, 1):
                 text.append(f"{i}. {it.url}")
         if not text:
-            text = ["Нечего показывать. Сейчас нет запущенных видео и очередь пуста."]
+            text = ["Очередь пуста."]
     await msg.reply("\n".join(text))
 
+@dp.message(Command("start"))
+async def cmd_start(msg: Message):
+    if msg.from_user.id != OWNER_ID:
+        return
+    asyncio.create_task(start_queue_runner())
+    await msg.reply("Очередь запущена.")
 
 @dp.message(Command("stop"))
 async def cmd_stop(msg: Message):
@@ -291,97 +184,14 @@ async def cmd_stop(msg: Message):
         proc = state.process
     if proc:
         await stop_process(proc)
-    await msg.reply("Останавливаю очередь. Возвращаю заглушку.")
-    await start_placeholder()
-
-
-@dp.message(Command("pause"))
-async def cmd_pause(msg: Message):
-    if msg.from_user.id != OWNER_ID:
-        return
-    async with state.lock:
-        proc = state.process
-        cur = state.current
-    if not proc:
-        await msg.reply("Нечего ставить на паузу.")
-        return
-    try:
-        pause_process_posix(proc)
-        async with state.lock:
-            state.is_paused = True
-            if cur and cur.url == PLACEHOLDER_URL and state.placeholder_last_start:
-                played = time.time() - state.placeholder_last_start
-                state.placeholder_pos += played
-                state.placeholder_last_start = None
-        await msg.reply("Поставлено на паузу.")
-    except Exception as e:
-        await msg.reply(f"Ошибка паузы: {e}")
-
-
-@dp.message(Command("resume"))
-async def cmd_resume(msg: Message):
-    if msg.from_user.id != OWNER_ID:
-        return
-    async with state.lock:
-        proc = state.process
-        cur = state.current
-    if not proc:
-        await msg.reply("Нечего резюмировать.")
-        return
-    try:
-        resume_process_posix(proc)
-        async with state.lock:
-            state.is_paused = False
-            if cur and cur.url == PLACEHOLDER_URL:
-                state.placeholder_last_start = time.time()
-        await msg.reply("Продолжил воспроизведение.")
-    except Exception as e:
-        await msg.reply(f"Ошибка resume: {e}")
-
-
-@dp.message(Command("break"))
-async def cmd_break(msg: Message):
-    if msg.from_user.id != OWNER_ID:
-        return
-    async with state.lock:
-        cur = state.current
-        proc = state.process
-        is_queue = state.playing_queue
-    if not proc or not cur:
-        await msg.reply("Сейчас ничего не играет, break не сработает.")
-        return
-    if cur.url == PLACEHOLDER_URL:
-        await msg.reply("Нельзя прервать заглушку.")
-        return
-    await msg.reply("Прерываю текущее видео...")
-    await stop_process(proc)
-    if is_queue:
-        await msg.reply("Если очередь запущена — включаю следующий.")
-    else:
-        await msg.reply("Возврат к заглушке.")
-        await start_placeholder()
-
+    await msg.reply("Очередь остановлена.")
 
 # ---------------- startup ----------------
-async def on_startup():
-    asyncio.create_task(start_placeholder())
-    try:
-        await bot.send_message(OWNER_ID, "Бот запущен. Запущена видео-заглушка.")
-    except Exception:
-        pass
-
-
 async def main():
-    await on_startup()
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Stopped by user")
         sys.exit(0)
