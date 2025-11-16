@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from yt_dlp import YoutubeDL
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -59,25 +60,28 @@ async def owner_only(msg: Message) -> bool:
 
 
 def get_video_stream_url(youtube_url: str) -> str:
-    """
-    Возвращает прямой URL для ffmpeg через yt-dlp -g.
-    Бросает RuntimeError при ошибке.
-    """
-    try:
-        res = subprocess.run(
-            [YTDLP_CMD, "-f", "best", "-g", youtube_url],
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=30,
-        )
-        url = res.stdout.strip().splitlines()[0]
-        if not url:
-            raise RuntimeError("yt-dlp вернул пустой адрес")
-        return url
-    except Exception as e:
-        raise RuntimeError(f"Can't get stream url: {e}")
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "best",   # можно "bestvideo+bestaudio/best"
+        "noplaylist": True,
+    }
 
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=False)
+
+    # В info есть прямые ссылки
+    if "url" in info:
+        return info["url"]
+
+    # либо в streams
+    if "formats" in info and info["formats"]:
+        # ищем самый лучший рабочий формат
+        for f in reversed(info["formats"]):
+            if f.get("url"):
+                return f["url"]
+
+    raise RuntimeError("Не удалось получить прямой URL из yt_dlp")
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
     """
@@ -422,3 +426,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopped by user")
         sys.exit(0)
+
