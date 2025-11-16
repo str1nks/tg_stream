@@ -18,7 +18,7 @@ from aiogram.types import Message
 TG_BOT_TOKEN = "8396785240:AAG_Ys7UP7C1iwZQPeLW8cc0j__xz8GeCaM"
 OWNER_ID = 5135680104
 RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
-STREAM_KEY = "2420740683:eyDLqeL_rVJgR44Uhv3aXA"
+STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
 COOKIES_FILE = "cookies.txt"
 
