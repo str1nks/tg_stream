@@ -61,7 +61,7 @@ async def owner_only(msg: Message) -> bool:
 def get_video_stream_url(youtube_url: str) -> str:
     """
     Получаем прямой потоковый URL (HLS/DASH) для ffmpeg.
-    yt-dlp НЕ скачивает видео на диск, только отдаёт ссылку на сегменты.
+    yt-dlp НЕ скачивает видео на диск, только возвращает ссылку.
     """
     ydl_opts = {
         "quiet": True,
@@ -78,6 +78,7 @@ def get_video_stream_url(youtube_url: str) -> str:
         return info["url"]
 
     if "formats" in info:
+        # Ищем поток с HLS/DASH
         for f in info["formats"]:
             if f.get("protocol") in ("m3u8_native", "https") and f.get("url"):
                 return f["url"]
@@ -87,15 +88,10 @@ def get_video_stream_url(youtube_url: str) -> str:
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
     """
-    Запускаем ffmpeg с low-latency параметрами.
+    Запускаем ffmpeg, читаем из input_url и пушим в FULL_RTMP.
     """
     args = [
         FFMPEG_CMD,
-        "-fflags", "+nobuffer",
-        "-flags", "+low_delay",
-        "-avioflags", "direct",
-        "-analyzeduration", "1000000",
-        "-probesize", "500000",
         "-i", input_url,
         "-c:v", "libx264",
         "-preset", "veryfast",
