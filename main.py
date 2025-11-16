@@ -18,7 +18,7 @@ from aiogram.types import Message
 TG_BOT_TOKEN = "8396785240:AAG_Ys7UP7C1iwZQPeLW8cc0j__xz8GeCaM"
 OWNER_ID = 5135680104
 RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
-STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
+STREAM_KEY = "2438025732:ImXRMnHS6wkcQKxtsG9atQ"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
 COOKIES_FILE = "cookies.txt"
 
@@ -389,3 +389,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopped by user")
         sys.exit(0)
+
