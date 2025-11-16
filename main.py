@@ -56,29 +56,38 @@ async def owner_only(msg: Message) -> bool:
 
 
 def get_video_stream_url(youtube_url: str) -> str:
+    """
+    Получаем прямой потоковый URL (HLS/DASH) для ffmpeg.
+    yt-dlp НЕ скачивает видео на диск, только возвращает ссылку.
+    """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "best",
+        "format": "best[ext=mp4]/best",  # сначала mp4, иначе лучшее
         "noplaylist": True,
         "cookiefile": COOKIES_FILE,
     }
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
+
+    # Если уже прямой URL доступен
     if "url" in info:
         return info["url"]
-    if "formats" in info and info["formats"]:
-        for f in reversed(info["formats"]):
-            if f.get("url"):
+
+    # Ищем поток с HLS/DASH или bestvideo+bestaudio
+    if "formats" in info:
+        for f in info["formats"]:
+            if f.get("protocol") in ("m3u8_native", "https") and f.get("url"):
                 return f["url"]
+
     raise RuntimeError("Не удалось получить прямой потоковый URL")
 
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
     args = [
         FFMPEG_CMD,
-        "-re",
-        "-i", input_url,
+        "-i", input_url,               # читаем поток напрямую
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
@@ -93,9 +102,10 @@ def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subp
     ]
     if extra_args:
         args = args[:-1] + extra_args + [args[-1]]
-    # Отправляем stdout/stderr в /dev/null, чтобы ffmpeg не блокировал процесс
+
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
     return proc
+
 
 
 async def stop_process(proc: subprocess.Popen):
@@ -380,3 +390,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopped by user")
         sys.exit(0)
+
