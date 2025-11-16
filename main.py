@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# main.py - полностью рабочий для Aiogram 3.22 + поток YouTube → RTMP
+# main.py
 import asyncio
 import os
+import shlex
 import signal
 import subprocess
 import sys
 import time
-from yt_dlp import YoutubeDL
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -14,16 +14,18 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 
-# ================= CONFIG =================
+# ========== CONFIG (вставь свои данные, уже взял из сообщения) ==========
 TG_BOT_TOKEN = "8396785240:AAG_Ys7UP7C1iwZQPeLW8cc0j__xz8GeCaM"
 OWNER_ID = 5135680104
 RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
 STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
-COOKIES_FILE = "cookies.txt"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
+# Заглушка (циклично)
 PLACEHOLDER_URL = "https://www.youtube.com/watch?v=G-kF940PFE4"
-FFMPEG_CMD = "ffmpeg"
-# ==========================================
+# Путь к утилитам
+YTDLP_CMD = "yt-dlp"  # или полный путь
+FFMPEG_CMD = "ffmpeg"  # или полный путь
+# ========================================================================
 
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher()
@@ -32,7 +34,7 @@ dp = Dispatcher()
 @dataclass
 class VideoItem:
     url: str
-    title: Optional[str] = None
+    title: Optional[str] = None  # можно расширить через yt-dlp info
     added_by: Optional[int] = None
 
 
@@ -43,41 +45,48 @@ class StreamState:
     queue: List[VideoItem] = field(default_factory=list)
     playing_queue: bool = False
     is_paused: bool = False
-    placeholder_pos: float = 0.0
-    placeholder_last_start: Optional[float] = None
+    placeholder_pos: float = 0.0  # seconds already played of placeholder
+    placeholder_last_start: Optional[float] = None  # timestamp when placeholder started
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 state = StreamState()
 
-# ----------------- Utils -----------------
+
+# ---------------- utilities ----------------
 async def owner_only(msg: Message) -> bool:
     return msg.from_user and msg.from_user.id == OWNER_ID
 
 
 def get_video_stream_url(youtube_url: str) -> str:
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best",
-        "noplaylist": True,
-        "cookiefile": COOKIES_FILE,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
-    if "url" in info:
-        return info["url"]
-    if "formats" in info and info["formats"]:
-        for f in reversed(info["formats"]):
-            if f.get("url"):
-                return f["url"]
-    raise RuntimeError("Не удалось получить прямой потоковый URL")
+    """
+    Возвращает прямой URL для ffmpeg через yt-dlp -g.
+    Бросает RuntimeError при ошибке.
+    """
+    try:
+        res = subprocess.run(
+            [YTDLP_CMD, "-f", "best", "-g", youtube_url],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=30,
+        )
+        url = res.stdout.strip().splitlines()[0]
+        if not url:
+            raise RuntimeError("yt-dlp вернул пустой адрес")
+        return url
+    except Exception as e:
+        raise RuntimeError(f"Can't get stream url: {e}")
 
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
+    """
+    Запускает ffmpeg, читает из input_url и пушит в FULL_RTMP.
+    Команда настроена на потоковую передачу (h264, aac).
+    """
     args = [
         FFMPEG_CMD,
-        "-re",
+        "-re",                # читать в реальном времени
         "-i", input_url,
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -93,8 +102,8 @@ def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subp
     ]
     if extra_args:
         args = args[:-1] + extra_args + [args[-1]]
-    # Отправляем stdout/stderr в /dev/null, чтобы ffmpeg не блокировал процесс
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+    # Запускаем в новой сессии чтобы корректно посылать сигналы
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
     return proc
 
 
@@ -114,6 +123,7 @@ async def stop_process(proc: subprocess.Popen):
 
 
 def pause_process_posix(proc: subprocess.Popen):
+    # Requires POSIX
     if proc and proc.poll() is None:
         os.killpg(os.getpgid(proc.pid), signal.SIGSTOP)
 
@@ -123,45 +133,43 @@ def resume_process_posix(proc: subprocess.Popen):
         os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
 
 
-async def safe_task(coro):
-    try:
-        await coro
-    except Exception as e:
-        try:
-            await bot.send_message(OWNER_ID, f"Ошибка таска: {e}")
-        except Exception:
-            pass
-
-
-# ------------- Core streaming -------------
-async def play_item(item: VideoItem):
+# ------------ core streaming logic -------------
+async def play_item(item: VideoItem, allow_placeholder_resume: bool = True):
+    """
+    Запустить один item (играет пока ffmpeg не завершится).
+    Если item.url == PLACEHOLDER_URL, стартует с placeholder_pos и обновляет placeholder_last_start.
+    """
     async with state.lock:
         state.current = item
         state.is_paused = False
 
+    # prepare input stream URL
     try:
         direct = get_video_stream_url(item.url)
-        await bot.send_message(OWNER_ID, f"Поток получен: {direct[:50]}...")
     except Exception as e:
         await bot.send_message(OWNER_ID, f"Ошибка получения потока для {item.url}: {e}")
         return
 
+    # if placeholder - seek to saved position
     extra_ff_args = None
     if item.url == PLACEHOLDER_URL:
+        # use ffmpeg -ss to start from offset (approximate). To resume, we need to re-run ffmpeg with -ss
         ss = int(state.placeholder_pos)
         if ss > 0:
             extra_ff_args = ["-ss", str(ss)]
-
     proc = spawn_ffmpeg(direct, extra_args=extra_ff_args)
     async with state.lock:
         state.process = proc
         if item.url == PLACEHOLDER_URL:
             state.placeholder_last_start = time.time()
 
+    # Wait for process end in background (read stderr for detection optional)
     try:
         await asyncio.to_thread(proc.wait)
     finally:
+        # process ended
         async with state.lock:
+            # if it was placeholder, accumulate played time
             if item.url == PLACEHOLDER_URL and state.placeholder_last_start:
                 played = time.time() - state.placeholder_last_start
                 state.placeholder_pos += played
@@ -169,25 +177,41 @@ async def play_item(item: VideoItem):
             state.process = None
             state.current = None
 
+    # after a normal video ends, if we are playing queue, continue to next
     async with state.lock:
         if state.playing_queue and state.queue:
+            # next will be started by queue runner
             return
         if state.playing_queue and not state.queue:
+            # queue exhausted -> return to placeholder
             await start_placeholder()
+        # if not queue playing, do nothing (stay on placeholder or idle)
 
 
 async def start_placeholder():
+    """
+    Запускает заглушку (заменяет текущий процесс).
+    """
     async with state.lock:
+        # if already playing placeholder, nothing
         if state.current and state.current.url == PLACEHOLDER_URL:
             return
+        # stop current process if any
         proc = state.process
     if proc:
+        # if stopping other video, and it's not placeholder, we must end it
         await stop_process(proc)
+
+    # start placeholder item (it will resume using placeholder_pos)
     placeholder_item = VideoItem(url=PLACEHOLDER_URL, title="placeholder")
-    asyncio.create_task(safe_task(play_item(placeholder_item)))
+    # spawn as background task
+    asyncio.create_task(play_item(placeholder_item))
 
 
 async def start_queue_runner():
+    """
+    Запускает последовательный показ очереди.
+    """
     async with state.lock:
         if state.playing_queue:
             return
@@ -201,24 +225,31 @@ async def start_queue_runner():
                 state.playing_queue = False
                 break
             item = state.queue.pop(0)
+        # stop current process (placeholder or single play)
         async with state.lock:
             proc = state.process
         if proc:
             await stop_process(proc)
+        # play this item synchronously (task will wait until ended)
         await play_item(item)
+        # loop continues and picks next
+    # queue finished -> return to placeholder
     await start_placeholder()
 
 
-# ----------------- Bot Handlers -----------------
+# --------------- Bot handlers -----------------
 @dp.message(Command("start"))
 async def cmd_start_queue(msg: Message):
     if msg.from_user.id != OWNER_ID:
         return
+    await msg.reply("Запуск очереди...")
+    # start queue runner if anything in queue
     async with state.lock:
         if not state.queue:
             await msg.reply("Очередь пуста.")
             return
-    asyncio.create_task(safe_task(start_queue_runner()))
+    # start runner in background
+    asyncio.create_task(start_queue_runner())
     await msg.reply("Очередь запущена.")
 
 
@@ -232,17 +263,20 @@ async def cmd_play(msg: Message):
         return
     url = args[1].strip()
     await msg.reply(f"Запускаю: {url}")
+    # stop current (but save placeholder progress if placeholder was playing)
     async with state.lock:
         proc = state.process
         was_placeholder = state.current and state.current.url == PLACEHOLDER_URL
     if proc:
+        # if stopping placeholder, accumulate played time
         if was_placeholder and state.placeholder_last_start:
             played = time.time() - state.placeholder_last_start
             state.placeholder_pos += played
             state.placeholder_last_start = None
         await stop_process(proc)
+    # not queue: single play
     state.playing_queue = False
-    asyncio.create_task(safe_task(play_item(VideoItem(url=url, added_by=msg.from_user.id))))
+    asyncio.create_task(play_item(VideoItem(url=url, added_by=msg.from_user.id)))
 
 
 @dp.message(Command("add"))
@@ -286,8 +320,9 @@ async def cmd_stop(msg: Message):
         proc = state.process
     if proc:
         await stop_process(proc)
+    # start placeholder
     await msg.reply("Останавливаю очередь. Возвращаю заглушку.")
-    asyncio.create_task(safe_task(start_placeholder()))
+    await start_placeholder()
 
 
 @dp.message(Command("pause"))
@@ -300,6 +335,7 @@ async def cmd_pause(msg: Message):
     if not proc:
         await msg.reply("Нечего ставить на паузу.")
         return
+    # POSIX pause
     try:
         pause_process_posix(proc)
         async with state.lock:
@@ -348,25 +384,30 @@ async def cmd_break(msg: Message):
     if cur.url == PLACEHOLDER_URL:
         await msg.reply("Нельзя прервать заглушку.")
         return
+    # Stop current video; if queue running, next will start automatically; else go to placeholder
     await msg.reply("Прерываю текущее видео...")
     await stop_process(proc)
     if is_queue:
+        # queue runner will handle next item
         await msg.reply("Если очередь запущена — включаю следующий.")
     else:
         await msg.reply("Возврат к заглушке.")
-        asyncio.create_task(safe_task(start_placeholder()))
+        await start_placeholder()
 
 
-# ---------------- Startup -----------------
+# -------------- startup / main -----------------
 async def on_startup():
-    asyncio.create_task(safe_task(start_placeholder()))
+    # при старте — запустить placeholder и уведомить владельца
+    asyncio.create_task(start_placeholder())
     try:
         await bot.send_message(OWNER_ID, "Бот запущен. Запущена видео-заглушка.")
     except Exception:
+        # просто продолжаем — возможно бот не может отправить сообщение
         pass
 
 
 async def main():
+    # register handlers already via decorator usage
     await on_startup()
     try:
         await dp.start_polling(bot)
@@ -375,6 +416,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Запуск
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
