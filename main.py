@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# main.py - полностью рабочий для Aiogram 3.22 + поток YouTube → RTMP
+# main.py
 import asyncio
 import os
 import signal
 import subprocess
 import sys
 import time
-from yt_dlp import YoutubeDL
 from dataclasses import dataclass, field
 from typing import List, Optional
+from yt_dlp import YoutubeDL
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
@@ -19,9 +19,11 @@ TG_BOT_TOKEN = "8396785240:AAG_Ys7UP7C1iwZQPeLW8cc0j__xz8GeCaM"
 OWNER_ID = 5135680104
 RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
 STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
-COOKIES_FILE = "cookies.txt"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
+COOKIES_FILE = "cookies.txt"
+
 PLACEHOLDER_URL = "https://www.youtube.com/watch?v=G-kF940PFE4"
+YTDLP_CMD = "yt-dlp"
 FFMPEG_CMD = "ffmpeg"
 # ==========================================
 
@@ -50,7 +52,8 @@ class StreamState:
 
 state = StreamState()
 
-# ----------------- Utils -----------------
+
+# --------------- utils ----------------
 async def owner_only(msg: Message) -> bool:
     return msg.from_user and msg.from_user.id == OWNER_ID
 
@@ -58,12 +61,12 @@ async def owner_only(msg: Message) -> bool:
 def get_video_stream_url(youtube_url: str) -> str:
     """
     Получаем прямой потоковый URL (HLS/DASH) для ffmpeg.
-    yt-dlp НЕ скачивает видео на диск, только возвращает ссылку.
+    yt-dlp НЕ скачивает видео на диск, только отдаёт ссылку на сегменты.
     """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "best[ext=mp4]/best",  # сначала mp4, иначе лучшее
+        "format": "best[ext=mp4]/best",
         "noplaylist": True,
         "cookiefile": COOKIES_FILE,
     }
@@ -71,11 +74,9 @@ def get_video_stream_url(youtube_url: str) -> str:
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
 
-    # Если уже прямой URL доступен
     if "url" in info:
         return info["url"]
 
-    # Ищем поток с HLS/DASH или bestvideo+bestaudio
     if "formats" in info:
         for f in info["formats"]:
             if f.get("protocol") in ("m3u8_native", "https") and f.get("url"):
@@ -85,9 +86,17 @@ def get_video_stream_url(youtube_url: str) -> str:
 
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
+    """
+    Запускаем ffmpeg с low-latency параметрами.
+    """
     args = [
         FFMPEG_CMD,
-        "-i", input_url,               # читаем поток напрямую
+        "-fflags", "+nobuffer",
+        "-flags", "+low_delay",
+        "-avioflags", "direct",
+        "-analyzeduration", "1000000",
+        "-probesize", "500000",
+        "-i", input_url,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-tune", "zerolatency",
@@ -105,7 +114,6 @@ def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subp
 
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
     return proc
-
 
 
 async def stop_process(proc: subprocess.Popen):
@@ -133,17 +141,7 @@ def resume_process_posix(proc: subprocess.Popen):
         os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
 
 
-async def safe_task(coro):
-    try:
-        await coro
-    except Exception as e:
-        try:
-            await bot.send_message(OWNER_ID, f"Ошибка таска: {e}")
-        except Exception:
-            pass
-
-
-# ------------- Core streaming -------------
+# --------------- core streaming ----------------
 async def play_item(item: VideoItem):
     async with state.lock:
         state.current = item
@@ -151,7 +149,6 @@ async def play_item(item: VideoItem):
 
     try:
         direct = get_video_stream_url(item.url)
-        await bot.send_message(OWNER_ID, f"Поток получен: {direct[:50]}...")
     except Exception as e:
         await bot.send_message(OWNER_ID, f"Ошибка получения потока для {item.url}: {e}")
         return
@@ -194,7 +191,7 @@ async def start_placeholder():
     if proc:
         await stop_process(proc)
     placeholder_item = VideoItem(url=PLACEHOLDER_URL, title="placeholder")
-    asyncio.create_task(safe_task(play_item(placeholder_item)))
+    asyncio.create_task(play_item(placeholder_item))
 
 
 async def start_queue_runner():
@@ -216,19 +213,21 @@ async def start_queue_runner():
         if proc:
             await stop_process(proc)
         await play_item(item)
+
     await start_placeholder()
 
 
-# ----------------- Bot Handlers -----------------
+# --------------- bot commands ----------------
 @dp.message(Command("start"))
 async def cmd_start_queue(msg: Message):
     if msg.from_user.id != OWNER_ID:
         return
+    await msg.reply("Запуск очереди...")
     async with state.lock:
         if not state.queue:
             await msg.reply("Очередь пуста.")
             return
-    asyncio.create_task(safe_task(start_queue_runner()))
+    asyncio.create_task(start_queue_runner())
     await msg.reply("Очередь запущена.")
 
 
@@ -252,7 +251,7 @@ async def cmd_play(msg: Message):
             state.placeholder_last_start = None
         await stop_process(proc)
     state.playing_queue = False
-    asyncio.create_task(safe_task(play_item(VideoItem(url=url, added_by=msg.from_user.id))))
+    asyncio.create_task(play_item(VideoItem(url=url, added_by=msg.from_user.id)))
 
 
 @dp.message(Command("add"))
@@ -297,7 +296,7 @@ async def cmd_stop(msg: Message):
     if proc:
         await stop_process(proc)
     await msg.reply("Останавливаю очередь. Возвращаю заглушку.")
-    asyncio.create_task(safe_task(start_placeholder()))
+    await start_placeholder()
 
 
 @dp.message(Command("pause"))
@@ -364,12 +363,12 @@ async def cmd_break(msg: Message):
         await msg.reply("Если очередь запущена — включаю следующий.")
     else:
         await msg.reply("Возврат к заглушке.")
-        asyncio.create_task(safe_task(start_placeholder()))
+        await start_placeholder()
 
 
-# ---------------- Startup -----------------
+# ---------------- startup ----------------
 async def on_startup():
-    asyncio.create_task(safe_task(start_placeholder()))
+    asyncio.create_task(start_placeholder())
     try:
         await bot.send_message(OWNER_ID, "Бот запущен. Запущена видео-заглушка.")
     except Exception:
@@ -390,4 +389,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopped by user")
         sys.exit(0)
-
