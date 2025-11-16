@@ -20,6 +20,7 @@ TG_BOT_TOKEN = "8396785240:AAG_Ys7UP7C1iwZQPeLW8cc0j__xz8GeCaM"
 OWNER_ID = 5135680104
 RTMP_URL = "rtmps://dc4-1.rtmp.t.me/s/"
 STREAM_KEY = "3114622344:MN4WNnEPwg7OPDCHqzw9Nw"
+COOKIES_FILE = "cookies.txt"
 FULL_RTMP = RTMP_URL.rstrip("/") + "/" + STREAM_KEY
 # Заглушка (циклично)
 PLACEHOLDER_URL = "https://www.youtube.com/watch?v=G-kF940PFE4"
@@ -63,25 +64,23 @@ def get_video_stream_url(youtube_url: str) -> str:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "best",   # можно "bestvideo+bestaudio/best"
+        "format": "best",
         "noplaylist": True,
+        "cookiefile": COOKIES_FILE,
     }
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
 
-    # В info есть прямые ссылки
     if "url" in info:
         return info["url"]
 
-    # либо в streams
     if "formats" in info and info["formats"]:
-        # ищем самый лучший рабочий формат
         for f in reversed(info["formats"]):
             if f.get("url"):
                 return f["url"]
 
-    raise RuntimeError("Не удалось получить прямой URL из yt_dlp")
+    raise RuntimeError("Не удалось получить прямой потоковый URL")
 
 def spawn_ffmpeg(input_url: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
     """
@@ -426,4 +425,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopped by user")
         sys.exit(0)
+
 
